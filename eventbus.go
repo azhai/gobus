@@ -2,6 +2,7 @@ package gobus
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,7 +31,6 @@ const (
 // Event 事件/消息
 type Event struct {
 	ID       string         `cbor:"id"`
-	Group    string         `cbor:"group"`
 	Topic    string         `cbor:"topic"`
 	Data     map[string]any `cbor:"data"`
 	Status   Status         `cbor:"status"`
@@ -41,7 +41,6 @@ type Event struct {
 
 // Subscription 订阅关系
 type Subscription struct {
-	Group        string
 	Topic        string
 	Mode         DeliverMode
 	SubscriberID string
@@ -55,23 +54,26 @@ type HandlerFunc func(event *Event)
 type AckCallback func(event *Event)
 
 // EventBus 事件总线
+//
+// Topic 使用前缀分组，例如 "db:create"、"db:insert"、"cache:set"。
+// 前缀部分（冒号前的部分）相当于原来的 group，支持多层前缀如 "db:primary:create"。
 type EventBus struct {
 	cache *fastcache.Cache
 	mu    sync.RWMutex
 
-	// 订阅者管理：key = "group:topic" -> []*Subscription
+	// 订阅者管理：key = topic -> []*Subscription
 	subscriptions map[string][]*Subscription
 
-	// 待分发消息队列：key = "group:topic" -> []*Event（按优先级排序）
+	// 待分发消息队列：key = topic -> []*Event（按优先级排序）
 	pendingQueue map[string][]*Event
 
 	// 消息索引：key = messageID -> *Event（sync.Map 自身线程安全，无需加锁）
 	events sync.Map
 
-	// group -> topic集合
-	groupTopics map[string]map[string]struct{}
+	// 所有已注册的 topic 集合（用于 ListTopics 前缀搜索）
+	topics map[string]struct{}
 
-	// group:topic -> data keys
+	// topic -> data keys（记录每个 topic 下 data 中出现过的 key）
 	topicDataKeys map[string]map[string]struct{}
 
 	// 消息ID自增（atomic 自身线程安全，无需加锁）
@@ -90,7 +92,7 @@ func NewEventBus(maxBytes int) *EventBus {
 		cache:         fastcache.New(maxBytes),
 		subscriptions: make(map[string][]*Subscription),
 		pendingQueue:  make(map[string][]*Event),
-		groupTopics:   make(map[string]map[string]struct{}),
+		topics:        make(map[string]struct{}),
 		topicDataKeys: make(map[string]map[string]struct{}),
 	}
 }
@@ -109,16 +111,10 @@ func (eb *EventBus) getAckCallback() AckCallback {
 	return val.(AckCallback)
 }
 
-// subKey 生成订阅关系的key
-func subKey(group, topic string) string {
-	return group + ":" + topic
-}
-
-// Publish 发布消息
-func (eb *EventBus) Publish(group, topic string, data map[string]any, priority int, needAck bool) (*Event, error) {
-	if group == "" {
-		return nil, fmt.Errorf("group 不能为空")
-	}
+// Publish 发布消息到指定 topic。
+//
+// 如果该 topic 没有任何订阅者，执行空操作（no-op），不存储、不入队，返回 nil。
+func (eb *EventBus) Publish(topic string, data map[string]any, priority int, needAck bool) (*Event, error) {
 	if topic == "" {
 		return nil, fmt.Errorf("topic 不能为空")
 	}
@@ -129,10 +125,15 @@ func (eb *EventBus) Publish(group, topic string, data map[string]any, priority i
 		return nil, fmt.Errorf("priority 必须在 1~5 范围内，当前值: %d", priority)
 	}
 
+	// 先检查是否有订阅者，无订阅者则 no-op
+	subs := eb.getSubscriptions(topic)
+	if len(subs) == 0 {
+		return nil, nil
+	}
+
 	id := fmt.Sprintf("%d", eb.msgIDCounter.Add(1))
 	event := &Event{
 		ID:       id,
-		Group:    group,
 		Topic:    topic,
 		Data:     data,
 		Status:   StatusPending,
@@ -141,31 +142,21 @@ func (eb *EventBus) Publish(group, topic string, data map[string]any, priority i
 		Created:  time.Now().Unix(),
 	}
 
-	// FastCache 线程安全，无需加锁
-	if err := eb.storeEvent(event); err != nil {
-		return nil, fmt.Errorf("存储失败: %w", err)
-	}
-
 	// sync.Map 线程安全，无需加锁
 	eb.events.Store(id, event)
 
-	// 更新内存索引（Go map 非线程安全，需加锁）
-	key := subKey(group, topic)
+	// 更新内存索引 + 入队 + 取订阅者快照（Go map 非线程安全，需加锁）
 	eb.mu.Lock()
-	if eb.groupTopics[group] == nil {
-		eb.groupTopics[group] = make(map[string]struct{})
-	}
-	eb.groupTopics[group][topic] = struct{}{}
+	eb.topics[topic] = struct{}{}
 
-	if eb.topicDataKeys[key] == nil {
-		eb.topicDataKeys[key] = make(map[string]struct{})
+	if eb.topicDataKeys[topic] == nil {
+		eb.topicDataKeys[topic] = make(map[string]struct{})
 	}
 	for k := range data {
-		eb.topicDataKeys[key][k] = struct{}{}
+		eb.topicDataKeys[topic][k] = struct{}{}
 	}
 
-	eb.pendingQueue[key] = insertByPriority(eb.pendingQueue[key], event)
-	subs := eb.subscriptions[key]
+	eb.pendingQueue[topic] = insertByPriority(eb.pendingQueue[topic], event)
 	subsCopy := make([]*Subscription, len(subs))
 	copy(subsCopy, subs)
 	eb.mu.Unlock()
@@ -177,11 +168,24 @@ func (eb *EventBus) Publish(group, topic string, data map[string]any, priority i
 	return event, nil
 }
 
-// Subscribe 订阅消息
-func (eb *EventBus) Subscribe(group, topic string, mode DeliverMode, subscriberID string, handler HandlerFunc) error {
-	if group == "" {
-		return fmt.Errorf("group 不能为空")
+// getSubscriptions 获取 topic 的订阅者快照（读锁保护）
+func (eb *EventBus) getSubscriptions(topic string) []*Subscription {
+	eb.mu.RLock()
+	defer eb.mu.RUnlock()
+
+	subs := eb.subscriptions[topic]
+	if len(subs) == 0 {
+		return nil
 	}
+	result := make([]*Subscription, len(subs))
+	copy(result, subs)
+	return result
+}
+
+// Subscribe 订阅消息。
+//
+// 订阅后如果有待分发消息，会立即触发分发。
+func (eb *EventBus) Subscribe(topic string, mode DeliverMode, subscriberID string, handler HandlerFunc) error {
 	if topic == "" {
 		return fmt.Errorf("topic 不能为空")
 	}
@@ -192,9 +196,7 @@ func (eb *EventBus) Subscribe(group, topic string, mode DeliverMode, subscriberI
 		return fmt.Errorf("handler 不能为空")
 	}
 
-	key := subKey(group, topic)
 	sub := &Subscription{
-		Group:        group,
 		Topic:        topic,
 		Mode:         mode,
 		SubscriberID: subscriberID,
@@ -204,21 +206,23 @@ func (eb *EventBus) Subscribe(group, topic string, mode DeliverMode, subscriberI
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
 
-	subs := eb.subscriptions[key]
+	eb.topics[topic] = struct{}{}
+
+	subs := eb.subscriptions[topic]
 	for i, s := range subs {
 		if s.SubscriberID == subscriberID {
-			eb.subscriptions[key][i] = sub
+			eb.subscriptions[topic][i] = sub
 			return nil
 		}
 	}
-	eb.subscriptions[key] = append(eb.subscriptions[key], sub)
+	eb.subscriptions[topic] = append(eb.subscriptions[topic], sub)
 
 	// 如果有待分发消息，立即尝试分发
-	if pending := eb.pendingQueue[key]; len(pending) > 0 {
+	if pending := eb.pendingQueue[topic]; len(pending) > 0 {
 		pendingCopy := make([]*Event, len(pending))
 		copy(pendingCopy, pending)
-		subsCopy := make([]*Subscription, len(eb.subscriptions[key]))
-		copy(subsCopy, eb.subscriptions[key])
+		subsCopy := make([]*Subscription, len(eb.subscriptions[topic]))
+		copy(subsCopy, eb.subscriptions[topic])
 
 		eb.mu.Unlock()
 		for _, evt := range pendingCopy {
@@ -231,21 +235,19 @@ func (eb *EventBus) Subscribe(group, topic string, mode DeliverMode, subscriberI
 }
 
 // Unsubscribe 取消订阅
-func (eb *EventBus) Unsubscribe(group, topic, subscriberID string) {
-	key := subKey(group, topic)
-
+func (eb *EventBus) Unsubscribe(topic, subscriberID string) {
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
 
-	subs := eb.subscriptions[key]
+	subs := eb.subscriptions[topic]
 	for i, s := range subs {
 		if s.SubscriberID == subscriberID {
-			eb.subscriptions[key] = append(subs[:i], subs[i+1:]...)
+			eb.subscriptions[topic] = append(subs[:i], subs[i+1:]...)
 			break
 		}
 	}
-	if len(eb.subscriptions[key]) == 0 {
-		delete(eb.subscriptions, key)
+	if len(eb.subscriptions[topic]) == 0 {
+		delete(eb.subscriptions, topic)
 	}
 }
 
@@ -282,35 +284,35 @@ func (eb *EventBus) Ack(messageID string) error {
 	return nil
 }
 
-// ListTopics 查询group下的topic列表
-func (eb *EventBus) ListTopics(group string) []string {
+// ListTopics 按前缀搜索 topic 列表。
+//
+// prefix 为空时返回所有已注册的 topic。
+// 例如：ListTopics("db") 返回 ["db:create", "db:insert"]
+func (eb *EventBus) ListTopics(prefix string) []string {
 	eb.mu.RLock()
 	defer eb.mu.RUnlock()
 
-	topics, ok := eb.groupTopics[group]
-	if !ok {
-		return []string{}
-	}
-
-	result := make([]string, 0, len(topics))
-	for t := range topics {
-		result = append(result, t)
+	var result []string
+	for t := range eb.topics {
+		if prefix == "" || strings.HasPrefix(t, prefix) {
+			result = append(result, t)
+		}
 	}
 	return result
 }
 
-// ListDataKeys 查询group+topic下data的key列表
-func (eb *EventBus) ListDataKeys(group, topic string) []string {
-	if group == "" || topic == "" {
+// ListDataKeys 查询 topic 下 data 的 key 列表。
+//
+// 返回该 topic 所有已发布消息的 data 字段中出现过的不重复 key。
+func (eb *EventBus) ListDataKeys(topic string) []string {
+	if topic == "" {
 		return []string{}
 	}
-
-	key := subKey(group, topic)
 
 	eb.mu.RLock()
 	defer eb.mu.RUnlock()
 
-	keys, ok := eb.topicDataKeys[key]
+	keys, ok := eb.topicDataKeys[topic]
 	if !ok {
 		return []string{}
 	}
@@ -362,11 +364,10 @@ func (eb *EventBus) deliver(event *Event, subs []*Subscription) {
 
 // removePendingLocked 从待分发队列移除消息，调用方必须已持有 eb.mu
 func (eb *EventBus) removePendingLocked(event *Event) {
-	key := subKey(event.Group, event.Topic)
-	pending := eb.pendingQueue[key]
+	pending := eb.pendingQueue[event.Topic]
 	for i, e := range pending {
 		if e.ID == event.ID {
-			eb.pendingQueue[key] = append(pending[:i], pending[i+1:]...)
+			eb.pendingQueue[event.Topic] = append(pending[:i], pending[i+1:]...)
 			return
 		}
 	}
