@@ -1,6 +1,7 @@
 package log
 
 import (
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -718,5 +719,159 @@ func TestParseLevel_EdgeCases(t *testing.T) {
 				t.Errorf("ParseLevel(%q) = %v, want %v (%s)", tt.input, result, tt.expected, tt.desc)
 			}
 		})
+	}
+}
+
+func TestRotateWriter_RotateStaleFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	logFile := filepath.Join(tmpDir, "stale.log")
+
+	w := &RotateWriter{
+		Filename:   logFile,
+		Cycle:      CycleDaily,
+		MaxBackups: 5,
+		Compress:   false,
+	}
+	defer w.Close()
+
+	w.Write([]byte("initial data\n"))
+
+	if err := w.Rotate(); err != nil {
+		t.Fatalf("Rotate failed: %v", err)
+	}
+
+	w.Write([]byte("after first rotate\n"))
+
+	if err := w.Rotate(); err != nil {
+		t.Fatalf("Second rotate failed: %v", err)
+	}
+
+	w.Write([]byte("current data\n"))
+
+	content, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+	if !contains(string(content), "current data") {
+		t.Errorf("Current file should contain latest data, got: %s", string(content))
+	}
+
+	entries, _ := os.ReadDir(tmpDir)
+	backupCount := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "stale-") && strings.HasSuffix(e.Name(), ".log") {
+			backupCount++
+		}
+	}
+	if backupCount < 1 {
+		t.Fatal("Expected at least one backup file after multiple rotations")
+	}
+}
+
+func TestRotateWriter_CompressStaleFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	logFile := filepath.Join(tmpDir, "compress.log")
+
+	w := &RotateWriter{
+		Filename:   logFile,
+		Cycle:      CycleDaily,
+		MaxBackups: 5,
+		Compress:   true,
+	}
+
+	w.Write([]byte("data before compress rotate\n"))
+
+	if err := w.Rotate(); err != nil {
+		t.Fatalf("Rotate failed: %v", err)
+	}
+
+	w.Close()
+
+	time.Sleep(500 * time.Millisecond)
+
+	entries, _ := os.ReadDir(tmpDir)
+	foundGz := false
+	foundBackup := false
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".gz") {
+			foundGz = true
+		}
+		if strings.HasPrefix(e.Name(), "compress-") && strings.HasSuffix(e.Name(), ".log") {
+			foundBackup = true
+		}
+	}
+	if !foundGz && !foundBackup {
+		t.Error("Expected backup file (.gz or .log) after rotation with Compress=true")
+	}
+}
+
+func TestRotateWriter_OpenExistingFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	logFile := filepath.Join(tmpDir, "existing.log")
+
+	os.WriteFile(logFile, []byte("pre-existing content\n"), 0644)
+
+	w := &RotateWriter{
+		Filename: logFile,
+		Cycle:    CycleDaily,
+	}
+	defer w.Close()
+
+	n, err := w.Write([]byte("new write\n"))
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if n != len("new write\n") {
+		t.Errorf("Write returned %d, want %d", n, len("new write\n"))
+	}
+
+	content, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+
+	strContent := string(content)
+	if !contains(strContent, "pre-existing content") {
+		t.Error("Should preserve pre-existing content")
+	}
+	if !contains(strContent, "new write") {
+		t.Error("Should contain new write")
+	}
+}
+
+func TestWriteToFile_InvalidGoCode(t *testing.T) {
+	tmpDir := t.TempDir()
+	outputPath := filepath.Join(tmpDir, "bad.go")
+
+	var buf bytes.Buffer
+	buf.WriteString("this is not valid go code {{{")
+
+	err := WriteToFile(&buf, outputPath)
+	if err == nil {
+		t.Error("Expected error for invalid Go code")
+	}
+}
+
+func TestNewFileWriter_InvalidPath(t *testing.T) {
+	_, err := NewFileWriter("/dev/null/impossible/path/test.log")
+	if err == nil {
+		t.Error("Expected error for invalid path")
+	}
+}
+
+func TestNewRotateLogger_NoCompression(t *testing.T) {
+	tmpDir := t.TempDir()
+	logFile := filepath.Join(tmpDir, "nocompress.log")
+
+	logger, err := NewRotateLogger(CycleDaily, logFile, 3, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if logger == nil {
+		t.Fatal("expected non-nil logger")
+	}
+	logger.Info("no compression test")
+	if _, err := os.Stat(logFile); err != nil {
+		t.Fatalf("log file should exist: %v", err)
 	}
 }

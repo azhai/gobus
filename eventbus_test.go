@@ -1529,6 +1529,385 @@ func TestRace_StoreEventConcurrent(t *testing.T) {
 }
 
 // ============================================================
+// 更多数据竞争测试
+// ============================================================
+
+func TestRace_PublishNoSubscriber(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			topic := fmt.Sprintf("nosub:topic%d", i%10)
+			eb.Publish(topic, map[string]any{"k": i}, 1, false)
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestRace_ConcurrentAckSameEvent(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	var ackCount atomic.Int32
+	eb.SetAckCallback(func(e *Event) { ackCount.Add(1) })
+
+	eb.Subscribe("g:t", Fanout, "s1", func(e *Event) {})
+
+	event, _ := eb.Publish("g:t", map[string]any{"k": "v"}, 1, true)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			eb.Ack(event.ID)
+		}()
+	}
+	wg.Wait()
+
+	if ackCount.Load() != 1 {
+		t.Fatalf("并发ACK同一消息应只触发1次回调，实际=%d", ackCount.Load())
+	}
+}
+
+func TestRace_PublishDifferentTopics(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		topic := fmt.Sprintf("race:topic%d", i%20)
+		wg.Add(1)
+		go func(topic string, i int) {
+			defer wg.Done()
+			eb.Subscribe(topic, Fanout, fmt.Sprintf("sub%d", i), func(e *Event) {})
+		}(topic, i)
+	}
+	for i := 0; i < 200; i++ {
+		topic := fmt.Sprintf("race:topic%d", i%20)
+		wg.Add(1)
+		go func(topic string, i int) {
+			defer wg.Done()
+			eb.Publish(topic, map[string]any{"k": i}, (i%5)+1, i%2 == 0)
+		}(topic, i)
+	}
+	wg.Wait()
+}
+
+func TestRace_SubscribePublishUnsubscribe(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	var wg sync.WaitGroup
+	const rounds = 50
+
+	for r := 0; r < rounds; r++ {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			eb.Subscribe("race:combo", Fanout, "s1", func(e *Event) {})
+		}()
+		go func() {
+			defer wg.Done()
+			eb.Publish("race:combo", map[string]any{"k": "v"}, 1, false)
+		}()
+		go func() {
+			defer wg.Done()
+			eb.Unsubscribe("race:combo", "s1")
+		}()
+	}
+	wg.Wait()
+}
+
+func TestRace_ListTopicsWhilePublish(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	for i := 0; i < 10; i++ {
+		topic := fmt.Sprintf("list:topic%d", i)
+		eb.Subscribe(topic, Fanout, "s1", func(e *Event) {})
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			topic := fmt.Sprintf("list:topic%d", i%10)
+			eb.Publish(topic, map[string]any{"k": i}, 1, false)
+		}(i)
+		go func() {
+			defer wg.Done()
+			topics := eb.ListTopics("list")
+			_ = topics
+		}()
+	}
+	wg.Wait()
+}
+
+func TestRace_ListDataKeysWhilePublish(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	eb.Subscribe("dk:topic", Fanout, "s1", func(e *Event) {})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			eb.Publish("dk:topic", map[string]any{fmt.Sprintf("key%d", i%5): i}, 1, false)
+		}(i)
+		go func() {
+			defer wg.Done()
+			keys := eb.ListDataKeys("dk:topic")
+			_ = keys
+		}()
+	}
+	wg.Wait()
+}
+
+func TestRace_MultiLevelPrefixPublish(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	var wg sync.WaitGroup
+	prefixes := []string{"app:db:create", "app:db:delete", "app:cache:set", "app:cache:get", "app:log:info"}
+
+	for _, p := range prefixes {
+		eb.Subscribe(p, Fanout, "s1", func(e *Event) {})
+	}
+
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			topic := prefixes[i%len(prefixes)]
+			eb.Publish(topic, map[string]any{"k": i}, (i%5)+1, i%3 == 0)
+		}(i)
+	}
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			eb.ListTopics("app:db")
+		}()
+	}
+	wg.Wait()
+}
+
+func TestRace_PublishAfterFullUnsubscribe(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	var wg sync.WaitGroup
+	const n = 50
+
+	for i := 0; i < n; i++ {
+		eb.Subscribe("race:empty", Fanout, fmt.Sprintf("s%d", i), func(e *Event) {})
+	}
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			eb.Unsubscribe("race:empty", fmt.Sprintf("s%d", i))
+		}(i)
+	}
+	wg.Wait()
+
+	var publishCount atomic.Int32
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			event, _ := eb.Publish("race:empty", map[string]any{"k": i}, 1, false)
+			if event != nil {
+				publishCount.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if publishCount.Load() != 0 {
+		t.Fatalf("全部取消订阅后发布应为no-op, 实际=%d", publishCount.Load())
+	}
+}
+
+func TestRace_FanoutMultipleSubscribersConcurrent(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	var count atomic.Int32
+	for i := 0; i < 10; i++ {
+		eb.Subscribe("race:fanout", Fanout, fmt.Sprintf("s%d", i), func(e *Event) {
+			count.Add(1)
+		})
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			eb.Publish("race:fanout", map[string]any{"k": i}, 1, false)
+		}(i)
+	}
+	wg.Wait()
+
+	if count.Load() != 1000 {
+		t.Fatalf("10个订阅者x100条消息=1000次, 实际=%d", count.Load())
+	}
+}
+
+func TestRace_AnyoneMultipleSubscribersConcurrent(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	var count atomic.Int32
+	for i := 0; i < 10; i++ {
+		eb.Subscribe("race:anyone", Anyone, fmt.Sprintf("s%d", i), func(e *Event) {
+			count.Add(1)
+		})
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			eb.Publish("race:anyone", map[string]any{"k": i}, 1, false)
+		}(i)
+	}
+	wg.Wait()
+
+	if count.Load() != 100 {
+		t.Fatalf("Anyone模式100条消息应100次调用, 实际=%d", count.Load())
+	}
+}
+
+func TestRace_SetCallbackConcurrent(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			eb.SetAckCallback(func(e *Event) {})
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestRace_PublishAndLoadEvent(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	eb.Subscribe("race:load", Fanout, "s1", func(e *Event) {})
+
+	var ids []string
+	for i := 0; i < 20; i++ {
+		event, _ := eb.Publish("race:load", map[string]any{"k": i}, 1, true)
+		ids = append(ids, event.ID)
+	}
+
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(2)
+		go func(id string) {
+			defer wg.Done()
+			eb.Ack(id)
+		}(id)
+		go func(id string) {
+			defer wg.Done()
+			_, _ = eb.loadEvent(id)
+		}(id)
+	}
+	wg.Wait()
+}
+
+func TestRace_SubscribeAndListTopics(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			topic := fmt.Sprintf("sl:topic%d", i%10)
+			eb.Subscribe(topic, Fanout, fmt.Sprintf("sub%d", i), func(e *Event) {})
+		}(i)
+		go func() {
+			defer wg.Done()
+			eb.ListTopics("sl")
+		}()
+	}
+	wg.Wait()
+}
+
+func TestRace_UnsubscribeAndListDataKeys(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	for i := 0; i < 20; i++ {
+		eb.Subscribe("ul:topic", Fanout, fmt.Sprintf("s%d", i), func(e *Event) {})
+	}
+	eb.Publish("ul:topic", map[string]any{"key1": "v1", "key2": "v2"}, 1, false)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			eb.Unsubscribe("ul:topic", fmt.Sprintf("s%d", i))
+		}(i)
+		go func() {
+			defer wg.Done()
+			eb.ListDataKeys("ul:topic")
+		}()
+	}
+	wg.Wait()
+}
+
+func TestRace_PublishWithMixedNeedAck(t *testing.T) {
+	eb := NewEventBus(0)
+	defer eb.cache.Reset()
+
+	var ackCount atomic.Int32
+	eb.SetAckCallback(func(e *Event) { ackCount.Add(1) })
+
+	eb.Subscribe("race:mixack", Fanout, "s1", func(e *Event) {})
+
+	var wg sync.WaitGroup
+	ids := make(chan string, 50)
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			needAck := i%2 == 0
+			event, _ := eb.Publish("race:mixack", map[string]any{"k": i}, (i%5)+1, needAck)
+			if needAck && event != nil {
+				ids <- event.ID
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(ids)
+
+	for id := range ids {
+		eb.Ack(id)
+	}
+}
+
+// ============================================================
 // SetAckCallback
 // ============================================================
 
