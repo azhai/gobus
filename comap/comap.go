@@ -1,7 +1,6 @@
 package comap
 
 import (
-	"iter"
 	"maps"
 	"slices"
 	"sync"
@@ -88,23 +87,11 @@ func (m *CoMap[K, V]) Keys() []K {
 // SortedKeys returns sorted keys from the map
 func (m *CoMap[K, V]) SortedKeys() []K {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return slices.Sorted(maps.Keys(m.data))
-}
-
-// Each returns an iterator over all key-value pairs in the map.
-// It takes a snapshot of the map under a read lock, then iterates over the snapshot.
-// Note: the snapshot is shallow — pointer values (*V) are shared with the original map.
-// Callers should not mutate the pointed-to values during iteration if concurrent writes are possible.
-func (m *CoMap[K, V]) Each() iter.Seq2[K, *V] {
-	m.mu.RLock()
-	snapshot := maps.Clone(m.data)
-	m.mu.RUnlock()
-	return func(yield func(K, *V) bool) {
-		for k, v := range snapshot {
-			if !yield(k, v) {
-				return
-			}
-		}
+	keys := make([]K, 0, len(m.data))
+	for k := range m.data {
+		keys = append(keys, k)
 	}
+	m.mu.RUnlock()
+	slices.Sort(keys)
+	return keys
 }

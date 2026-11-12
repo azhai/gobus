@@ -2,6 +2,7 @@ package log
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"go/format"
 	"io"
@@ -113,7 +114,7 @@ func NewFileLogger(logFile string, isJSON, addSource bool) (*slog.Logger, error)
 // Returns the created logger or an error
 func NewLoggerByWriter(writer io.Writer, isJSON, addSource bool) *slog.Logger {
 	if writer == nil {
-		return slog.New(slog.DiscardHandler)
+		return slog.New(discardHandler{})
 	}
 	opts := &slog.HandlerOptions{AddSource: addSource}
 	if isJSON {
@@ -159,3 +160,11 @@ func WriteToFile(buf *bytes.Buffer, outputPath string) error {
 	}
 	return nil
 }
+
+// discardHandler is the Go 1.22 stand-in for slog.DiscardHandler (Go 1.24).
+type discardHandler struct{}
+
+func (discardHandler) Enabled(context.Context, slog.Level) bool  { return false }
+func (discardHandler) Handle(context.Context, slog.Record) error { return nil }
+func (h discardHandler) WithAttrs([]slog.Attr) slog.Handler      { return h }
+func (h discardHandler) WithGroup(string) slog.Handler           { return h }

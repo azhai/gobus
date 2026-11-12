@@ -834,7 +834,7 @@ func TestMultipleLoggers(t *testing.T) {
 
 // TestSlogDiscardHandler tests DiscardHandler behavior
 func TestSlogDiscardHandler(t *testing.T) {
-	logger := slog.New(slog.DiscardHandler)
+	logger := slog.New(discardHandler{})
 
 	// Should not panic or error
 	logger.Info("this should be discarded")

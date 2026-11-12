@@ -79,6 +79,10 @@ type EventBus struct {
 	// 消息ID自增（atomic 自身线程安全，无需加锁）
 	msgIDCounter atomic.Int64
 
+	// ring 保存最近 completedRing 条已完成且无需 ACK 的消息 ID，
+	// 超过窗口的从 events 索引里删除（见 retainLocked）。
+	ring []string
+
 	// ACK回调（atomic.Value 线程安全，避免 SetAckCallback 与 Ack 并发竞争）
 	ackCallback atomic.Value
 }
@@ -356,6 +360,7 @@ func (eb *EventBus) deliver(event *Event, subs []*Subscription) {
 		eb.mu.Lock()
 		event.Status = StatusCompleted
 		eb.removePendingLocked(event)
+		eb.retainLocked(event.ID)
 		data := eb.marshalEvent(event)
 		eb.mu.Unlock()
 		eb.cache.Set([]byte("event:"+event.ID), data)
@@ -371,6 +376,21 @@ func (eb *EventBus) removePendingLocked(event *Event) {
 			return
 		}
 	}
+}
+
+// completedRing 是已完成且无需 ACK 的消息在 events 索引里保留的条数。
+// 这些消息只为「刚发送完就 Ack」这种调用习惯留个短期凭据，更早的会被回收，
+// 否则进程内总线（每秒几十条）会让 events 无界增长。
+const completedRing = 1024
+
+// retainLocked 记录一条已完成的消息 ID，并回收超出环形窗口的旧消息。
+// 调用方必须已持有 eb.mu。
+func (eb *EventBus) retainLocked(id string) {
+	if len(eb.ring) >= completedRing {
+		eb.events.Delete(eb.ring[0])
+		eb.ring = eb.ring[1:]
+	}
+	eb.ring = append(eb.ring, id)
 }
 
 // marshalEvent 序列化事件（调用方需持有锁或独占event）

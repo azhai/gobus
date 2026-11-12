@@ -2317,3 +2317,46 @@ func BenchmarkPublish_ManySubscribers(b *testing.B) {
 	}
 	b.StopTimer()
 }
+
+// TestFireAndForgetDoesNotLeak 是进程内总线长跑的回归保护：无需 ACK 的消息
+// 只保留最近 completedRing 条作为短期凭据，更早的必须回收，否则 events
+// 会随消息条数无界增长（进程内总线每秒几十条，长跑的服务端会一直涨内存）。
+func TestFireAndForgetDoesNotLeak(t *testing.T) {
+	eb := NewEventBus(1 << 20)
+	var hits int64
+	err := eb.Subscribe("demo:tick", Fanout, "counter", func(*Event) {
+		atomic.AddInt64(&hits, 1)
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	const n = 5000
+	for i := 0; i < n; i++ {
+		if _, err := eb.Publish("demo:tick", map[string]any{"i": i}, 3, false); err != nil {
+			t.Fatalf("publish #%d: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt64(&hits); got != n {
+		t.Fatalf("handler calls = %d, want %d", got, n)
+	}
+
+	kept := 0
+	eb.events.Range(func(any, any) bool { kept++; return true })
+	if kept > completedRing {
+		t.Fatalf("%d/%d fire-and-forget events are still retained (cap %d)",
+			kept, n, completedRing)
+	}
+
+	// 需要 ACK 的消息仍然保留，直到被确认。
+	ev, err := eb.Publish("demo:tick", map[string]any{"i": -1}, 3, true)
+	if err != nil {
+		t.Fatalf("publish ack: %v", err)
+	}
+	if _, ok := eb.events.Load(ev.ID); !ok {
+		t.Fatal("a message that needs an ack was dropped")
+	}
+	if err := eb.Ack(ev.ID); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+}
